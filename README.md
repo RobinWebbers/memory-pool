@@ -1,6 +1,6 @@
 # `typed-pool`
 
-**A fixed size allocator for single typed constant time (de)allocations.**
+**A fixed size allocator for single typed, constant time (de)allocations.**
 
 The typed pool reserves a fixed size of (virtual) memory and does not grow with
 new allocations. We store a pointer in free entries, so types smaller than a
