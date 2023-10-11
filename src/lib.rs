@@ -11,6 +11,8 @@
 //! # Example
 //! 
 //! ```rust
+//! #![feature(allocator_api)]
+//!
 //! use typed_pool::TypedPool;
 //! 
 //! struct Data {
@@ -18,16 +20,18 @@
 //! }
 //! 
 //! let capacity = 2_usize.pow(20);
-//! let pool = TypedPool::new(capacity);
+//! let pool = TypedPool::<Data>::new(capacity);
 //! 
-//! let elem = pool.alloc(Data { inner: 0 });
+//! let elem = Box::new_in(Data { inner: 0 }, &pool);
 //! 
 //! // We can deallocate during the lifetime of pool
 //! drop(elem);
 //! 
 //! // This new element can reuse the memory we freed
-//! let elem = pool.alloc(Data { inner: 5 });
+//! let elem = Box::new_in(Data { inner: 5 }, &pool);
 //! ```
+#![feature(allocator_api)]
+#![feature(slice_ptr_get)]
 
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![deny(missing_docs)]
@@ -41,12 +45,11 @@ mod test;
 use core::ptr::NonNull;
 use core::mem::ManuallyDrop;
 use core::cell::Cell;
-use core::ops::{Deref, DerefMut};
-use core::fmt;
 
-use alloc::alloc::Layout;
+use alloc::alloc::{Allocator, AllocError, Global, Layout};
 
-/// A typed object pool for constant time (de)allocations.
+/// A typed object pool for constant time (de)allocations. It is not thread safe
+/// and incurs space overhead for types smaller than a pointer.
 pub struct TypedPool<T> {
     /// The memory region from which we will allocate.
     memory: NonNull<[Item<T>]>,
@@ -57,24 +60,20 @@ pub struct TypedPool<T> {
 impl<T> TypedPool<T> {
     /// Create a typed pool with the specified capacity.
     pub fn new(capacity: usize) -> Self {
-        let address = if capacity == 0 {
-            NonNull::dangling()
-        } else {
-            let layout = Layout::array::<Item<T>>(capacity)
-                .expect("cannot allocate more than isize::MAX");
+        let layout = Layout::array::<Item<T>>(capacity)
+            .expect("cannot allocate more than isize::MAX");
 
-            // Zeroed memory will be None for Option<NonNull<T>>
-            let memory = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        // Zeroed memory will be None for Option<NonNull<T>>
+        let memory = Global.allocate_zeroed(layout)
+            .unwrap_or_else(|_| alloc::alloc::handle_alloc_error(layout));
 
-            NonNull::new(memory as _)
-                .unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout))
-        };
-
-        let memory = NonNull::slice_from_raw_parts(address, capacity);
+        // Cast the byte slice to an Item slice.
+        let base = memory.as_non_null_ptr().cast();
+        let memory = NonNull::slice_from_raw_parts(base, capacity);
 
         Self {
             memory,
-            next: address.into(),
+            next: base.into(),
         }
     }
 
@@ -83,16 +82,24 @@ impl<T> TypedPool<T> {
         self.memory.len()
     }
 
-    /// Allocates a new object in the pool. Note that the [`TypedPool`] does not
-    /// grow its backing memory after the initial allocation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the new allocation exceeds the capacity.
-    pub fn alloc(&self, val: T) -> Owned<'_, T> {
+    /// Check if the given pointer is in this pools address range.
+    /// It does NOT (and cannot) check whether the entry is allocated.
+    fn contains(&self, ptr: NonNull<Item<T>>) -> bool {
+        // The memory region is owned, so we can create a reference to it.
+        let slice = unsafe { self.memory.as_ref() };
+        slice.as_ptr_range().contains(&(ptr.as_ptr() as *const _))
+    }
+}
+
+unsafe impl<T> Allocator for TypedPool<T> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // Check if we are allocating the correct object (we cannot do more
+        // than to check layout requirements sadly).
+        if layout != Layout::new::<T>() { return Err(AllocError) }
+
         // Check if we have run out of memory
-        let mut item = self.next.get();
-        if !self.contains(item) { panic!("TypedPool out-of-memory") }
+        let item = self.next.get();
+        if !self.contains(item) { return Err(AllocError) }
 
         // Get the next allocation in the chain
         let redirect = unsafe { item.as_ref().next };
@@ -102,38 +109,24 @@ impl<T> TypedPool<T> {
         // or the one adjacent to the fully allocated block.
         self.next.set(redirect.unwrap_or(adjacent));
 
-        // We write first because we do not want to drop the unitialised 
-        // value that currently resides in data.
-        unsafe { 
-            *item.as_mut().data = val;
-            Owned::from_raw(item.cast(), self)
-        }
+        // Cast the item pointer to a u8 slice pointer.
+        let base: NonNull<u8> = item.cast();
+        let length = layout.size();
+        let slice = NonNull::slice_from_raw_parts(base, length);
+        Ok(slice)
     }
 
-    /// Deallocates the item, such that the memory will be used by subsequent
-    /// allocations. This does not drop the item that was contained.
-    ///
-    /// # Safety
-    ///
-    /// Improper use may lead to memory errors. Additionally, it is not checked
-    /// whether the item is contained in the allocator.
-    unsafe fn dealloc(&self, mut ptr: NonNull<Item<T>>) {
-        debug_assert!(self.contains(ptr));
-        let item = unsafe { ptr.as_mut() };
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        let mut ptr: NonNull<Item<T>> = ptr.cast();
+
+        assert_eq!(layout, Layout::new::<T>());
+        assert!(self.contains(ptr));
 
         // Let this entry point to the next free slot
-        item.next = Some(self.next.get());
+        ptr.as_mut().next = Some(self.next.get());
 
         // Let our next allocation be the one that was just freed
         self.next.set(ptr.into());
-    }
-
-    /// Check if the given pointer is in this pools address range.
-    /// It does NOT (and cannot) check whether the entry is allocated.
-    fn contains(&self, ptr: NonNull<Item<T>>) -> bool {
-        // The memory region is owned, so we can create a reference to it.
-        let slice = unsafe { self.memory.as_ref() };
-        slice.as_ptr_range().contains(&(ptr.as_ptr() as *const _))
     }
 }
 
@@ -151,92 +144,7 @@ impl<T> Drop for TypedPool<T> {
 union Item<T> {
     /// Pointer to the next free item, if this item is unalloceted.
     next: Option<NonNull<Item<T>>>,
-    /// Data of this allocated item.
-    data: ManuallyDrop<T>,
+    /// Data of this allocated item. This is here to get correct layout for the
+    /// allocations.
+    _data: ManuallyDrop<T>,
 }
-
-/// Ownership over an element allocated in a [`TypedPool`].
-pub struct Owned<'pool, T> {
-    data: NonNull<T>,
-    pool: &'pool TypedPool<T>,
-}
-
-impl<'pool, T> Owned<'pool, T> {
-    /// Constructs an [`Owned`] from a raw pointer and its [`TypedPool`].
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because improper use may lead to memory
-    /// problems. For example, a double-free may occur if the function is called
-    /// twice on the same raw pointer.
-    ///
-    /// This function does not check whether the pointer was indeed contained
-    /// by the [`TypedPool`].
-    pub unsafe fn from_raw(raw: NonNull<T>, pool: &'pool TypedPool<T>) -> Self {
-        debug_assert!(pool.contains(raw.cast()));
-
-        Self {
-            data: raw,
-            pool,
-        }
-    }
-
-    /// Consumes the [`Owned`], returning the raw pointer.
-    ///
-    /// Contrary to a Box, the underlying allocation is owned by a
-    /// [`TypedPool`]. The user is however responsible for dropping the inner
-    /// item, as the [`TypedPool`] does not drop remaining elements. The easiest
-    /// way to do this is to convert the raw point back into an [`Owned`] with
-    /// [`Owned::from_raw`]. It's destructor will then do the clean up.
-    pub fn into_raw(owned: Self) -> NonNull<T> {
-        let owned = ManuallyDrop::new(owned);
-        owned.data
-    }
-
-    /// Get a reference to the [`TypedPool`] this object was allocated in.
-    pub fn typed_pool(owned: &Self) -> &'pool TypedPool<T> {
-        owned.pool
-    }
-}
-
-impl<T: fmt::Display> fmt::Display for Owned<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&**self, f)
-    }
-}
-impl<T: fmt::Debug> fmt::Debug for Owned<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T> fmt::Pointer for Owned<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ptr: *const T = &**self;
-        fmt::Pointer::fmt(&ptr, f)
-    }
-}
-
-impl<T> Deref for Owned<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.data.as_ref() }
-    }
-}
-
-impl<T> DerefMut for Owned<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.data.as_mut() }
-    }
-}
-
-impl<T> Drop for Owned<'_, T> {
-    fn drop(&mut self) {
-        unsafe {
-            core::ptr::drop_in_place(self.data.as_ptr());
-            self.pool.dealloc(self.data.cast());
-        }
-    }
-}
-
