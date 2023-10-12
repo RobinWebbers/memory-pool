@@ -1,6 +1,6 @@
-//! **A fixed size allocator for single typed, constant time (de)allocations.**
+//! **A fixed-size block allocator for constant time (de)allocations.**
 //! 
-//! The typed pool reserves a fixed size of (virtual) memory and does not grow
+//! The memory pool reserves a fixed size of (virtual) memory and does not grow
 //! with new allocations. We store a pointer in free entries, so types smaller
 //! than a pointer have additional space overhead. The flipside is that we can
 //! rapidly allocate and free entries, no matter the access pattern.
@@ -13,14 +13,15 @@
 //! ```rust
 //! #![feature(allocator_api)]
 //!
-//! use typed_pool::TypedPool;
+//! use memory_pool::MemoryPool;
+//! use std::alloc::Layout;
 //! 
 //! struct Data {
 //!     inner: usize,
 //! }
 //! 
 //! let capacity = 2_usize.pow(20);
-//! let pool = TypedPool::<Data>::new(capacity);
+//! let pool = MemoryPool::new(capacity, Layout::new::<Data>());
 //! 
 //! let elem = Box::new_in(Data { inner: 0 }, &pool);
 //! 
@@ -32,6 +33,7 @@
 //! ```
 #![feature(allocator_api)]
 #![feature(slice_ptr_get)]
+#![feature(alloc_layout_extra)]
 
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![deny(missing_docs)]
@@ -43,35 +45,53 @@ extern crate alloc;
 mod test;
 
 use core::ptr::NonNull;
-use core::mem::ManuallyDrop;
 use core::cell::Cell;
 
 use alloc::alloc::{Allocator, AllocError, Global, Layout};
 
-/// A typed object pool for constant time (de)allocations. It is not thread safe
-/// and incurs space overhead for types smaller than a pointer.
-pub struct TypedPool<T> {
+/// A memory pool for (de)allocation fixed-size blocks in constant time. It is
+/// not thread safe and incurs space overhead for types smaller than a pointer.
+pub struct MemoryPool {
+    /// The layout requirement of the blocks in our allocator.
+    layout: Layout,
     /// The memory region from which we will allocate.
-    memory: NonNull<[Item<T>]>,
-    /// Pointer to the next free item.
-    next: Cell<NonNull<Item<T>>>,
+    memory: NonNull<[u8]>,
+    /// Pointer to the next free item. We store this as a u8 pointer because
+    /// the free list nodes are stored based on the layout of the blocks, not
+    /// their own.
+    next: Cell<NonNull<u8>>,
 }
 
-impl<T> TypedPool<T> {
-    /// Create a typed pool with the specified capacity.
-    pub fn new(capacity: usize) -> Self {
-        let layout = Layout::array::<Item<T>>(capacity)
-            .expect("cannot allocate more than isize::MAX");
+impl MemoryPool {
+    /// Create a memory pool with the a maximum capacity where each block
+    /// adheres the given layout requirements.
+    ///
+    /// Note that the minimum size for each allocation is a pointer. This means
+    /// that even zero sized types actually consume memory in this structure.
+    ///
+    /// # Panics
+    ///
+    /// This will panic on incorrect layouts and if the global allocator is out
+    /// of memory.
+    pub fn new(capacity: usize, layout: Layout) -> Self {
+        let layout = union_layout(layout, Layout::new::<Free>())
+            // Pad the layout to be multiples of the alignment. We use this
+            // property when calculating the next free entry.
+            .pad_to_align();
 
-        // Zeroed memory will be None for Option<NonNull<T>>
-        let memory = Global.allocate_zeroed(layout)
+        // Get the layout for the array.
+        let (array, _) = layout.repeat(capacity)
+            .expect("layout did not satisfy its constraints");
+
+        // Zeroed memory will be None for Option<NonNull<_>>
+        let memory = Global.allocate_zeroed(array)
             .unwrap_or_else(|_| alloc::alloc::handle_alloc_error(layout));
 
-        // Cast the byte slice to an Item slice.
-        let base = memory.as_non_null_ptr().cast();
-        let memory = NonNull::slice_from_raw_parts(base, capacity);
+        // The next free element is the first entry in the allocated block.
+        let base = memory.as_non_null_ptr();
 
         Self {
+            layout,
             memory,
             next: base.into(),
         }
@@ -79,72 +99,78 @@ impl<T> TypedPool<T> {
 
     /// The maximum number of entries this pool can contain.
     pub fn capacity(&self) -> usize {
-        self.memory.len()
+        self.memory.len() / self.layout.size()
     }
 
     /// Check if the given pointer is in this pools address range.
     /// It does NOT (and cannot) check whether the entry is allocated.
-    fn contains(&self, ptr: NonNull<Item<T>>) -> bool {
+    fn contains(&self, ptr: NonNull<u8>) -> bool {
         // The memory region is owned, so we can create a reference to it.
         let slice = unsafe { self.memory.as_ref() };
         slice.as_ptr_range().contains(&(ptr.as_ptr() as *const _))
     }
 }
 
-unsafe impl<T> Allocator for TypedPool<T> {
+unsafe impl Allocator for MemoryPool {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         // Check if we are allocating the correct object (we cannot do more
         // than to check layout requirements sadly).
-        if layout != Layout::new::<T>() { return Err(AllocError) }
+
+        // Check if given layout fits the layout requirements.
+        if self.layout != union_layout(self.layout, layout) { return Err(AllocError) }
 
         // Check if we have run out of memory
-        let item = self.next.get();
-        if !self.contains(item) { return Err(AllocError) }
+        let block = self.next.get();
+        if !self.contains(block) { return Err(AllocError) }
 
         // Get the next allocation in the chain
-        let redirect = unsafe { item.as_ref().next };
-        let adjacent = unsafe { NonNull::new_unchecked(item.as_ptr().add(1)) };
+        let redirect = unsafe { *block.cast::<Free>().as_ref() };
+
+        // Get the element adjecent to the current free one.
+        let adjacent = unsafe {
+            let adjacent = block.as_ptr().add(self.layout.size());
+            NonNull::new_unchecked(adjacent)
+        };
 
         // The next item is either the next on in the chain,
-        // or the one adjacent to the fully allocated block.
+        // or the one adjacent if there was none.
         self.next.set(redirect.unwrap_or(adjacent));
 
-        // Cast the item pointer to a u8 slice pointer.
-        let base: NonNull<u8> = item.cast();
-        let length = layout.size();
-        let slice = NonNull::slice_from_raw_parts(base, length);
+        // Construct the slice to the allocated block.
+        let slice = NonNull::slice_from_raw_parts(block, self.layout.size());
         Ok(slice)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let mut ptr: NonNull<Item<T>> = ptr.cast();
-
-        assert_eq!(layout, Layout::new::<T>());
-        assert!(self.contains(ptr));
+        // Check if given layout fits the layout requirements.
+        debug_assert_eq!(self.layout, union_layout(self.layout, layout));
+        // Check if the given pointer is contained in the allocator.
+        debug_assert!(self.contains(ptr));
 
         // Let this entry point to the next free slot
-        ptr.as_mut().next = Some(self.next.get());
+        *ptr.cast::<Free>().as_mut() = Some(self.next.get());
 
         // Let our next allocation be the one that was just freed
         self.next.set(ptr.into());
     }
 }
 
-impl<T> Drop for TypedPool<T> {
+impl Drop for MemoryPool {
     fn drop(&mut self) {
         // This exact layout was already created, so this cannot fail.
-        let layout = Layout::array::<Item<T>>(self.capacity()).unwrap();
+        let (layout, _) = self.layout.repeat(self.capacity()).unwrap();
         unsafe { alloc::alloc::dealloc(self.memory.cast().as_ptr(), layout) }
     }
 }
 
-/// An item in the allocator. Unallocated items should be intepreted
-/// as a pointer to the next free entry. Allocated entries are data.
-#[derive(Copy, Clone)]
-union Item<T> {
-    /// Pointer to the next free item, if this item is unalloceted.
-    next: Option<NonNull<Item<T>>>,
-    /// Data of this allocated item. This is here to get correct layout for the
-    /// allocations.
-    _data: ManuallyDrop<T>,
+/// A pointer to the next free entry in our pool. This will essentially form a
+/// chain of pointers in memory.
+type Free = Option<NonNull<u8>>;
+
+/// Returns a new layout as if the given two layouts were put into a union.
+fn union_layout(first: Layout, second: Layout) -> Layout {
+    let size = core::cmp::max(first.size(), second.size());
+    let align = core::cmp::max(first.align(), second.align());
+    Layout::from_size_align(size, align)
+        .expect("layout did not satisfy its constraints")
 }

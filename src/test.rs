@@ -1,24 +1,25 @@
-use super::TypedPool;
+use super::MemoryPool;
 use std::vec::Vec;
+use std::alloc::Layout;
 
 #[test]
 fn capacity_small() {
     let capacity = 2_usize.pow(4);
-    let pool = TypedPool::<u32>::new(capacity);
+    let pool = MemoryPool::new(capacity, Layout::new::<usize>());
     assert!(pool.capacity() == capacity);
 }
 
 #[test]
 fn capacity_large() {
     let capacity = 2_usize.pow(30);
-    let pool = TypedPool::<u32>::new(capacity);
+    let pool = MemoryPool::new(capacity, Layout::new::<u32>());
     assert!(pool.capacity() == capacity);
 }
 
 #[test]
 fn just_allocations() {
     let capacity = 2_usize.pow(8);
-    let pool = TypedPool::<usize>::new(capacity);
+    let pool = MemoryPool::new(capacity, Layout::new::<usize>());
 
     let vec: Vec<_> = (0..capacity).map(|i| Box::new_in(i, &pool)).collect();
 
@@ -30,7 +31,7 @@ fn just_allocations() {
 #[test]
 fn out_of_memory() {
     let capacity = 2_usize.pow(8);
-    let pool = TypedPool::<usize>::new(capacity);
+    let pool = MemoryPool::new(capacity, Layout::new::<usize>());
 
     let _vec: Vec<_> = (0..capacity).map(|i| Box::new_in(i, &pool)).collect();
 
@@ -44,7 +45,7 @@ fn out_of_memory() {
 #[test]
 fn reuse_freed_memory() {
     let capacity = 2_usize.pow(8);
-    let pool = TypedPool::<usize>::new(capacity);
+    let pool = MemoryPool::new(capacity, Layout::new::<usize>());
 
     let mut vec: Vec<_> = (0..capacity).map(|i| Box::new_in(i, &pool)).collect();
 
@@ -60,11 +61,19 @@ fn reuse_freed_memory() {
 #[test]
 fn zero_sized_types() {
     let capacity = 2_usize.pow(8);
-    let pool = TypedPool::<()>::new(capacity);
+    let pool = MemoryPool::new(capacity, Layout::new::<()>());
 
     let vec: Vec<_> = (0..capacity).map(|_| Box::new_in((), &pool)).collect();
 
     for unit in vec {
         assert_eq!((), *unit);
     }
+}
+
+#[test]
+fn allocate_smaller_block() {
+    let capacity = 2_usize.pow(8);
+    let pool = MemoryPool::new(capacity, Layout::new::<usize>());
+
+    let _ = Box::new_in(5_u8, &pool);
 }

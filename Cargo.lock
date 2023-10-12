@@ -3,5 +3,5 @@
 version = 3
 
 [[package]]
-name = "typed-pool"
+name = "memory-pool"
 version = "0.1.0"

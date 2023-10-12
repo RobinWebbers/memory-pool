@@ -1,8 +1,8 @@
-# `typed-pool`
+# `memory-pool`
 
-**A fixed size allocator for single typed, constant time (de)allocations.**
+**A fixed-size block allocator for constant time (de)allocations.**
 
-The typed pool reserves a fixed size of (virtual) memory and does not grow
+The memory pool reserves a fixed size of (virtual) memory and does not grow
 with new allocations. We store a pointer in free entries, so types smaller
 than a pointer have additional space overhead. The flipside is that we can
 rapidly allocate and free entries, no matter the access pattern.
@@ -14,14 +14,15 @@ The primary use case of this crate is as a performance optimisation for
 
 ```rust
 #![feature(allocator_api)]
-use typed_pool::TypedPool;
+use memory_pool::MemoryPool;
+use std::alloc::Layout;
 
 struct Data {
     inner: usize,
 }
 
 let capacity = 2_usize.pow(20);
-let pool = TypedPool::<Data>::new(capacity);
+let pool = MemoryPool::new(capacity, Layout::new::<Data>());
 
 let elem = Box::new_in(Data { inner: 0 }, &pool);
 
